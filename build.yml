@@ -1,0 +1,935 @@
+name: Build Voice Control APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Create full Android project structure
+        run: |
+          mkdir -p app/src/main/java/com/voicecontrol/app
+          mkdir -p app/src/main/res/layout
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/menu
+          mkdir -p app/src/main/res/anim
+          mkdir -p app/src/main/res/mipmap-hdpi
+          mkdir -p app/src/main/res/mipmap-mdpi
+          mkdir -p app/src/main/res/mipmap-xhdpi
+          mkdir -p app/src/main/res/mipmap-xxhdpi
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          mkdir -p gradle/wrapper
+
+      - name: Write AndroidManifest.xml
+        run: |
+          cat > app/src/main/AndroidManifest.xml << 'ENDOFFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools"
+              package="com.voicecontrol.app">
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <uses-permission android:name="android.permission.BLUETOOTH"/>
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN"/>
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+              <uses-permission android:name="android.permission.WRITE_SETTINGS" tools:ignore="ProtectedPermissions"/>
+              <uses-permission android:name="android.permission.CAMERA"/>
+              <uses-permission android:name="android.permission.FLASHLIGHT"/>
+              <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+              <uses-permission android:name="android.permission.CALL_PHONE"/>
+              <uses-permission android:name="android.permission.SEND_SMS"/>
+              <uses-permission android:name="android.permission.READ_CONTACTS"/>
+              <uses-feature android:name="android.hardware.microphone" android:required="true"/>
+              <uses-feature android:name="android.hardware.camera.flash" android:required="false"/>
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/AppTheme"
+                  android:hardwareAccelerated="true"
+                  android:largeHeap="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".SettingsActivity" android:exported="false" android:parentActivityName=".MainActivity"/>
+                  <activity android:name=".CommandHistoryActivity" android:exported="false" android:parentActivityName=".MainActivity"/>
+                  <service android:name=".VoiceListenerService" android:exported="false" android:foregroundServiceType="microphone" android:enabled="true"/>
+                  <receiver android:name=".BootReceiver" android:exported="true" android:enabled="true">
+                      <intent-filter android:priority="999">
+                          <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                          <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          ENDOFFILE
+
+      - name: Write MainActivity.java
+        run: |
+          cat > app/src/main/java/com/voicecontrol/app/MainActivity.java << 'ENDOFFILE'
+          package com.voicecontrol.app;
+          import android.Manifest;
+          import android.app.AlertDialog;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.speech.RecognitionListener;
+          import android.speech.RecognizerIntent;
+          import android.speech.SpeechRecognizer;
+          import android.view.Menu;
+          import android.view.MenuItem;
+          import android.view.View;
+          import android.view.animation.Animation;
+          import android.view.animation.AnimationUtils;
+          import android.widget.ImageView;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import androidx.annotation.NonNull;
+          import androidx.appcompat.app.AppCompatActivity;
+          import androidx.appcompat.widget.Toolbar;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.content.ContextCompat;
+          import com.google.android.material.card.MaterialCardView;
+          import com.google.android.material.chip.Chip;
+          import com.google.android.material.floatingactionbutton.FloatingActionButton;
+          import com.google.android.material.snackbar.Snackbar;
+          import com.google.android.material.switchmaterial.SwitchMaterial;
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Date;
+          import java.util.List;
+          import java.util.Locale;
+          public class MainActivity extends AppCompatActivity implements RecognitionListener {
+              private static final String TAG = "VoiceControl";
+              private static final int REQUEST_PERMISSIONS = 1001;
+              private static final int RESTART_DELAY = 600;
+              private SpeechRecognizer speechRecognizer;
+              private SystemController systemController;
+              private CommandProcessor commandProcessor;
+              private TtsManager ttsManager;
+              private HistoryManager historyManager;
+              private FloatingActionButton fabMic;
+              private ImageView ivWaveform;
+              private TextView tvStatus, tvOutput, tvLastCmd, tvDeviceInfo;
+              private MaterialCardView cardStatus;
+              private SwitchMaterial switchContinuous;
+              private ScrollView scrollOutput;
+              private Chip chipBt, chipWifi, chipFlash, chipMute;
+              private boolean isListening = false;
+              private boolean isContinuous = false;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private SharedPreferences prefs;
+              private Animation pulseAnim;
+              private static final String[] PERMISSIONS = {
+                  Manifest.permission.RECORD_AUDIO,
+                  Manifest.permission.MODIFY_AUDIO_SETTINGS,
+                  Manifest.permission.CALL_PHONE,
+                  Manifest.permission.READ_CONTACTS,
+                  Manifest.permission.CAMERA,
+              };
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  setContentView(R.layout.activity_main);
+                  prefs = getSharedPreferences("vcprefs", MODE_PRIVATE);
+                  systemController = new SystemController(this);
+                  commandProcessor = new CommandProcessor(this, systemController);
+                  ttsManager = new TtsManager(this);
+                  historyManager = new HistoryManager(this);
+                  Toolbar tb = findViewById(R.id.toolbar);
+                  setSupportActionBar(tb);
+                  if (getSupportActionBar() != null) {
+                      getSupportActionBar().setTitle("Voice Control");
+                      getSupportActionBar().setSubtitle("Android " + Build.VERSION.RELEASE);
+                  }
+                  bindViews();
+                  pulseAnim = AnimationUtils.loadAnimation(this, R.anim.pulse);
+                  checkPermissions();
+                  refreshChips();
+                  showDeviceInfo();
+              }
+              private void bindViews() {
+                  fabMic = findViewById(R.id.fab_mic);
+                  ivWaveform = findViewById(R.id.iv_waveform);
+                  tvStatus = findViewById(R.id.tv_status);
+                  tvOutput = findViewById(R.id.tv_output);
+                  tvLastCmd = findViewById(R.id.tv_last_cmd);
+                  tvDeviceInfo = findViewById(R.id.tv_device_info);
+                  cardStatus = findViewById(R.id.card_status);
+                  switchContinuous = findViewById(R.id.switch_continuous);
+                  scrollOutput = findViewById(R.id.scroll_output);
+                  chipBt = findViewById(R.id.chip_bt);
+                  chipWifi = findViewById(R.id.chip_wifi);
+                  chipFlash = findViewById(R.id.chip_flash);
+                  chipMute = findViewById(R.id.chip_mute);
+                  fabMic.setOnClickListener(v -> { if (isListening) stopVoice(); else startVoice(); });
+                  boolean savedCont = prefs.getBoolean("continuous", false);
+                  switchContinuous.setChecked(savedCont);
+                  isContinuous = savedCont;
+                  switchContinuous.setOnCheckedChangeListener((b, on) -> {
+                      isContinuous = on;
+                      prefs.edit().putBoolean("continuous", on).apply();
+                      if (on) { startService(new Intent(this, VoiceListenerService.class).setAction(VoiceListenerService.ACTION_START)); log("Always-on listening ENABLED"); }
+                      else { startService(new Intent(this, VoiceListenerService.class).setAction(VoiceListenerService.ACTION_STOP)); log("Always-on listening DISABLED"); }
+                  });
+                  chipBt.setOnClickListener(v -> runCmd("toggle bluetooth"));
+                  chipWifi.setOnClickListener(v -> runCmd("toggle wifi"));
+                  chipFlash.setOnClickListener(v -> runCmd("toggle flashlight"));
+                  chipMute.setOnClickListener(v -> runCmd("toggle mute"));
+                  setStatus("Tap mic to start", false);
+              }
+              private void startVoice() {
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      Snackbar.make(fabMic, "Microphone permission needed", Snackbar.LENGTH_LONG).setAction("Grant", v -> checkPermissions()).show();
+                      return;
+                  }
+                  if (speechRecognizer != null) speechRecognizer.destroy();
+                  speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+                  speechRecognizer.setRecognitionListener(this);
+                  Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                  i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+                  i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault());
+                  i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
+                  i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+                  if (Build.VERSION.SDK_INT >= 33) i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
+                  i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L);
+                  try {
+                      speechRecognizer.startListening(i);
+                      isListening = true;
+                      fabMic.setImageResource(R.drawable.ic_mic_active);
+                      ivWaveform.startAnimation(pulseAnim);
+                      setStatus("Listening...", true);
+                  } catch (Exception e) { setStatus("Error: " + e.getMessage(), false); }
+              }
+              private void stopVoice() {
+                  if (speechRecognizer != null) speechRecognizer.stopListening();
+                  isListening = false;
+                  fabMic.setImageResource(R.drawable.ic_mic);
+                  ivWaveform.clearAnimation();
+                  setStatus("Processing...", false);
+              }
+              private void runCmd(String cmd) {
+                  tvLastCmd.setText("\"" + cmd + "\"");
+                  CommandResult r = commandProcessor.process(cmd);
+                  if (r != null) { log(r.getOutput()); ttsManager.speak(r.getTts()); historyManager.add(cmd, r.getMessage(), r.ok()); handler.postDelayed(this::refreshChips, 400); }
+              }
+              @Override public void onReadyForSpeech(Bundle p) { setStatus("Ready...", true); }
+              @Override public void onBeginningOfSpeech() { setStatus("Hearing you...", true); }
+              @Override public void onBufferReceived(byte[] b) {}
+              @Override public void onEvent(int t, Bundle p) {}
+              @Override public void onRmsChanged(float rms) { float s = 1f + Math.max(0, rms) / 25f; ivWaveform.setScaleX(s); ivWaveform.setScaleY(s); }
+              @Override public void onEndOfSpeech() { isListening = false; ivWaveform.setScaleX(1f); ivWaveform.setScaleY(1f); setStatus("Processing...", false); }
+              @Override public void onError(int err) {
+                  isListening = false; fabMic.setImageResource(R.drawable.ic_mic); ivWaveform.clearAnimation(); ivWaveform.setScaleX(1f); ivWaveform.setScaleY(1f);
+                  setStatus("Try again", false);
+                  if (isContinuous) handler.postDelayed(this::startVoice, RESTART_DELAY * 3L);
+              }
+              @Override public void onPartialResults(Bundle b) {
+                  ArrayList<String> p = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                  if (p != null && !p.isEmpty()) tvLastCmd.setText("Hearing: \"" + p.get(0) + "\"");
+              }
+              @Override public void onResults(Bundle results) {
+                  isListening = false; fabMic.setImageResource(R.drawable.ic_mic); ivWaveform.clearAnimation(); ivWaveform.setScaleX(1f); ivWaveform.setScaleY(1f);
+                  ArrayList<String> m = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                  if (m != null && !m.isEmpty()) { String cmd = m.get(0); setStatus("Got it!", false); log("You said: \"" + cmd + "\""); runCmd(cmd); }
+                  else setStatus("No speech detected", false);
+                  if (isContinuous) handler.postDelayed(this::startVoice, RESTART_DELAY);
+              }
+              private void setStatus(String msg, boolean active) {
+                  runOnUiThread(() -> { tvStatus.setText(msg); cardStatus.setCardBackgroundColor(getColor(active ? R.color.colorListening : R.color.colorIdle)); });
+              }
+              private void log(String text) {
+                  runOnUiThread(() -> {
+                      String ts = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
+                      String cur = tvOutput.getText().toString();
+                      String line = "[" + ts + "] " + text;
+                      tvOutput.setText(cur.isEmpty() ? line : cur + "\n\n" + line);
+                      handler.postDelayed(() -> scrollOutput.fullScroll(View.FOCUS_DOWN), 80);
+                  });
+              }
+              private void refreshChips() {
+                  runOnUiThread(() -> {
+                      try {
+                          boolean bt = systemController.isBluetoothOn(); boolean wf = systemController.isWifiOn(); boolean fl = systemController.isFlashOn(); boolean mu = systemController.isMuted();
+                          chipBt.setText(bt ? "BT: ON" : "BT: OFF"); chipBt.setChipBackgroundColorResource(bt ? R.color.colorActive : R.color.colorInactive);
+                          chipWifi.setText(wf ? "WiFi: ON" : "WiFi: OFF"); chipWifi.setChipBackgroundColorResource(wf ? R.color.colorActive : R.color.colorInactive);
+                          chipFlash.setText(fl ? "Flash: ON" : "Flash: OFF"); chipFlash.setChipBackgroundColorResource(fl ? R.color.colorActive : R.color.colorInactive);
+                          chipMute.setText(mu ? "Muted" : "Sound: ON"); chipMute.setChipBackgroundColorResource(mu ? R.color.colorWarning : R.color.colorActive);
+                      } catch (Exception ignored) {}
+                  });
+              }
+              private void showDeviceInfo() { tvDeviceInfo.setText(Build.MANUFACTURER + " " + Build.MODEL + " | Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"); }
+              private void checkPermissions() {
+                  List<String> need = new ArrayList<>();
+                  for (String p : PERMISSIONS) if (ContextCompat.checkSelfPermission(this, p) != PackageManager.PERMISSION_GRANTED) need.add(p);
+                  if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) need.add(Manifest.permission.POST_NOTIFICATIONS);
+                  if (!need.isEmpty()) ActivityCompat.requestPermissions(this, need.toArray(new String[0]), REQUEST_PERMISSIONS);
+                  else onReady();
+              }
+              @Override public void onRequestPermissionsResult(int req, @NonNull String[] perms, @NonNull int[] res) { super.onRequestPermissionsResult(req, perms, res); onReady(); }
+              private void onReady() {
+                  log("Voice Control ready!\n\nSay commands like:\n- Turn on WiFi\n- Turn on flashlight\n- Set volume to 50 percent\n- Increase brightness\n- Mute / Unmute\n- Open YouTube\n- What time is it?\n- What is my battery level?\n- Take screenshot\n- Dark mode on\n- Call Mom");
+              }
+              @Override public boolean onCreateOptionsMenu(Menu m) { getMenuInflater().inflate(R.menu.main_menu, m); return true; }
+              @Override public boolean onOptionsItemSelected(@NonNull MenuItem item) {
+                  int id = item.getItemId();
+                  if (id == R.id.menu_history) { startActivity(new Intent(this, CommandHistoryActivity.class)); return true; }
+                  else if (id == R.id.menu_settings) { startActivity(new Intent(this, SettingsActivity.class)); return true; }
+                  else if (id == R.id.menu_clear) { tvOutput.setText(""); return true; }
+                  else if (id == R.id.menu_help) { new AlertDialog.Builder(this).setTitle("Commands").setMessage(CommandProcessor.helpText()).setPositiveButton("OK", null).show(); return true; }
+                  return super.onOptionsItemSelected(item);
+              }
+              @Override protected void onDestroy() { super.onDestroy(); if (speechRecognizer != null) speechRecognizer.destroy(); ttsManager.shutdown(); }
+              @Override protected void onPause() { super.onPause(); if (isListening && !isContinuous) stopVoice(); }
+          }
+          ENDOFFILE
+
+      - name: Write CommandResult.java
+        run: |
+          cat > app/src/main/java/com/voicecontrol/app/CommandResult.java << 'ENDOFFILE'
+          package com.voicecontrol.app;
+          public class CommandResult {
+              private final boolean success; private final String message, output, tts;
+              private CommandResult(boolean ok, String msg, String out, String tts) { this.success=ok; this.message=msg; this.output=out; this.tts=tts; }
+              public static CommandResult ok(String msg, String tts) { return new CommandResult(true, msg, "OK: "+msg, tts); }
+              public static CommandResult fail(String msg, String tts) { return new CommandResult(false, msg, "FAIL: "+msg, tts); }
+              public boolean ok() { return success; } public String getMessage() { return message; } public String getOutput() { return output; } public String getTts() { return tts; }
+          }
+          ENDOFFILE
+
+      - name: Write CommandProcessor.java
+        run: |
+          cat > app/src/main/java/com/voicecontrol/app/CommandProcessor.java << 'ENDOFFILE'
+          package com.voicecontrol.app;
+          import android.content.Context; import android.content.Intent; import android.media.AudioManager; import android.net.Uri; import android.provider.Settings;
+          import java.text.SimpleDateFormat; import java.util.*; import java.util.regex.*;
+          public class CommandProcessor {
+              private final Context ctx; private final SystemController sys;
+              private static final Pattern P_ON=Pattern.compile("(?:turn on|enable|activate|switch on)\\s+(.+)",Pattern.CASE_INSENSITIVE);
+              private static final Pattern P_OFF=Pattern.compile("(?:turn off|disable|deactivate|switch off)\\s+(.+)",Pattern.CASE_INSENSITIVE);
+              private static final Pattern P_TOG=Pattern.compile("(?:toggle|flip|switch)\\s+(.+)",Pattern.CASE_INSENSITIVE);
+              private static final Pattern P_VOL=Pattern.compile("(?:set|change)\\s+volume\\s+(?:to\\s*)?(\\d+)",Pattern.CASE_INSENSITIVE);
+              private static final Pattern P_VUP=Pattern.compile("(?:increase|raise|turn up)\\s+volume",Pattern.CASE_INSENSITIVE);
+              private static final Pattern P_VDN=Pattern.compile("(?:decrease|lower|turn down|reduce)\\s+volume",Pattern.CASE_INSENSITIVE);
+              private static final Pattern P_BRI=Pattern.compile("(?:set|change)\\s+brightness\\s+(?:to\\s*)?(\\d+)",Pattern.CASE_INSENSITIVE);
+              private static final Pattern P_BUP=Pattern.compile("(?:increase|raise|turn up|boost)\\s+brightness",Pattern.CASE_INSENSITIVE);
+              private static final Pattern P_BDN=Pattern.compile("(?:decrease|lower|turn down|dim)\\s+brightness",Pattern.CASE_INSENSITIVE);
+              private static final Pattern P_OPEN=Pattern.compile("(?:open|launch|start|run)\\s+(.+)",Pattern.CASE_INSENSITIVE);
+              private static final Pattern P_CALL=Pattern.compile("(?:call|phone|dial)\\s+(.+)",Pattern.CASE_INSENSITIVE);
+              private static final Pattern P_SMS=Pattern.compile("(?:text|message)\\s+(.+)",Pattern.CASE_INSENSITIVE);
+              private static final Map<String,String> SYN=new HashMap<>();
+              static {
+                  SYN.put("bt","bluetooth");SYN.put("bluetooth","bluetooth");SYN.put("wifi","wifi");SYN.put("wi-fi","wifi");SYN.put("wireless","wifi");SYN.put("internet","wifi");
+                  SYN.put("flashlight","flashlight");SYN.put("torch","flashlight");SYN.put("flash","flashlight");SYN.put("light","flashlight");
+                  SYN.put("mute","mute");SYN.put("silent","mute");SYN.put("silence","mute");SYN.put("sound","sound");
+                  SYN.put("dark mode","dark_mode");SYN.put("night mode","dark_mode");SYN.put("dark","dark_mode");
+                  SYN.put("rotation","rotation");SYN.put("auto rotate","rotation");SYN.put("rotate","rotation");
+                  SYN.put("do not disturb","dnd");SYN.put("dnd","dnd");SYN.put("airplane","airplane");SYN.put("airplane mode","airplane");
+                  SYN.put("location","location");SYN.put("gps","location");
+              }
+              private static final Map<String,String> APPS=new HashMap<>();
+              static {
+                  APPS.put("youtube","com.google.android.youtube");APPS.put("chrome","com.android.chrome");APPS.put("maps","com.google.android.apps.maps");
+                  APPS.put("gmail","com.google.android.gm");APPS.put("camera","com.android.camera2");APPS.put("settings","com.android.settings");
+                  APPS.put("photos","com.google.android.apps.photos");APPS.put("spotify","com.spotify.music");APPS.put("whatsapp","com.whatsapp");
+                  APPS.put("instagram","com.instagram.android");APPS.put("facebook","com.facebook.katana");APPS.put("twitter","com.twitter.android");
+                  APPS.put("netflix","com.netflix.mediaclient");APPS.put("clock","com.android.deskclock");APPS.put("calculator","com.android.calculator2");
+                  APPS.put("contacts","com.android.contacts");APPS.put("play store","com.android.vending");APPS.put("tiktok","com.zhiliaoapp.musically");
+                  APPS.put("snapchat","com.snapchat.android");APPS.put("zoom","us.zoom.videomeetings");APPS.put("files","com.android.documentsui");APPS.put("phone","com.android.dialer");
+              }
+              public CommandProcessor(Context ctx, SystemController sys) { this.ctx=ctx; this.sys=sys; }
+              public CommandResult process(String raw) {
+                  if (raw==null||raw.trim().isEmpty()) return CommandResult.fail("Empty command","Please say a command");
+                  String s=raw.trim().toLowerCase(Locale.getDefault()); Matcher m;
+                  if (s.matches(".*what.*(time|clock).*")||s.equals("time")||s.equals("what time is it")) { String t=new SimpleDateFormat("h:mm a",Locale.getDefault()).format(new Date()); return CommandResult.ok("Time: "+t,"The time is "+t); }
+                  if (s.matches(".*what.*(date|day).*")||s.equals("date")) { String d=new SimpleDateFormat("EEEE, MMMM d, yyyy",Locale.getDefault()).format(new Date()); return CommandResult.ok("Date: "+d,"Today is "+d); }
+                  if (s.matches(".*battery.*")||s.equals("battery")) { int l=sys.getBattery(); boolean c=sys.isCharging(); String msg="Battery: "+l+"%"+(c?" (charging)":""); return CommandResult.ok(msg,msg); }
+                  if (s.matches("mute|silence|silent|quiet")) return doMute(true);
+                  if (s.matches("unmute|loud|sound on|ring|unsilence")) return doMute(false);
+                  if ((m=P_VOL.matcher(s)).find()) return doVol(Integer.parseInt(m.group(1)));
+                  if (P_VUP.matcher(s).find()) return doVol(Math.min(100,sys.getVolumePct(AudioManager.STREAM_MUSIC)+15));
+                  if (P_VDN.matcher(s).find()) return doVol(Math.max(0,sys.getVolumePct(AudioManager.STREAM_MUSIC)-15));
+                  if (s.contains("volume")&&(s.contains("max")||s.contains("full"))) { sys.setVolume(100,AudioManager.STREAM_MUSIC); return CommandResult.ok("Volume max","Volume maximum"); }
+                  if (s.contains("volume")&&(s.contains("min")||s.contains("zero"))) { sys.setVolume(0,AudioManager.STREAM_MUSIC); return CommandResult.ok("Volume off","Volume off"); }
+                  if ((m=P_BRI.matcher(s)).find()) { int p=Integer.parseInt(m.group(1)); return r(sys.setBrightness((int)(p/100f*255)),"Brightness "+p+"%","Brightness "+p+" percent"); }
+                  if (P_BUP.matcher(s).find()) { int p=Math.min(100,sys.getBrightnessPct()+25); return r(sys.setBrightness((int)(p/100f*255)),"Brightness "+p+"%","Brightness increased"); }
+                  if (P_BDN.matcher(s).find()) { int p=Math.max(5,sys.getBrightnessPct()-25); return r(sys.setBrightness((int)(p/100f*255)),"Brightness "+p+"%","Brightness decreased"); }
+                  if (s.contains("brightness")&&s.contains("max")) { sys.setBrightness(255); return CommandResult.ok("Brightness max","Brightness maximum"); }
+                  if (s.contains("brightness")&&s.contains("auto")) { sys.setAutoBrightness(true); return CommandResult.ok("Auto brightness","Auto brightness enabled"); }
+                  if ((m=P_ON.matcher(s)).find()) return toggle(m.group(1).trim(),true);
+                  if ((m=P_OFF.matcher(s)).find()) return toggle(m.group(1).trim(),false);
+                  if ((m=P_TOG.matcher(s)).find()) { String f=norm(m.group(1).trim()); switch(f){case"bluetooth":return toggle("bluetooth",!sys.isBluetoothOn());case"wifi":return toggle("wifi",!sys.isWifiOn());case"flashlight":return toggle("flashlight",!sys.isFlashOn());case"mute":return doMute(!sys.isMuted());default:return toggle(f,true);} }
+                  if (s.matches("play|resume|unpause")) { sys.media(android.view.KeyEvent.KEYCODE_MEDIA_PLAY); return CommandResult.ok("Playing","Playing"); }
+                  if (s.matches("pause|stop music")) { sys.media(android.view.KeyEvent.KEYCODE_MEDIA_PAUSE); return CommandResult.ok("Paused","Paused"); }
+                  if (s.matches("next|next song|skip")) { sys.media(android.view.KeyEvent.KEYCODE_MEDIA_NEXT); return CommandResult.ok("Next","Next track"); }
+                  if (s.matches("previous|prev|last song")) { sys.media(android.view.KeyEvent.KEYCODE_MEDIA_PREVIOUS); return CommandResult.ok("Previous","Previous track"); }
+                  if (s.matches("(?:go )?home|home screen")) { sys.goHome(); return CommandResult.ok("Home","Going home"); }
+                  if (s.matches("(?:open )?settings")) { ctx.startActivity(new Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); return CommandResult.ok("Settings","Opening settings"); }
+                  if (s.matches("(?:take )?screenshot|capture screen")) { sys.screenshot(); return CommandResult.ok("Screenshot","Screenshot taken"); }
+                  if (s.matches("lock|lock screen|lock phone")) { sys.lock(); return CommandResult.ok("Locked","Screen locked"); }
+                  if (s.matches("(?:show |open )?notifications?")) { sys.notifications(); return CommandResult.ok("Notifications","Opening notifications"); }
+                  if ((m=P_CALL.matcher(s)).find()) { String who=m.group(1).trim(); sys.call(who); return CommandResult.ok("Calling "+who,"Calling "+who); }
+                  if ((m=P_SMS.matcher(s)).find()) { String who=m.group(1).trim(); sys.sms(who); return CommandResult.ok("Message to "+who,"Opening message to "+who); }
+                  if ((m=P_OPEN.matcher(s)).find()) { String app=m.group(1).trim(); String pkg=APPS.get(app); boolean launched=pkg!=null?sys.launch(pkg):sys.launchByName(app); return launched?CommandResult.ok("Opening "+app,"Opening "+app):CommandResult.fail("App not found: "+app,"Couldn't find "+app); }
+                  return CommandResult.fail("Unknown: \""+raw+"\"","I didn't understand. Try: turn on WiFi, set volume to 50, open YouTube.");
+              }
+              private CommandResult toggle(String rawFeat,boolean on) {
+                  String feat=norm(rawFeat);
+                  switch(feat) {
+                      case"bluetooth": return r(sys.setBluetooth(on),"Bluetooth "+(on?"ON":"OFF"),"Bluetooth "+(on?"enabled":"disabled"));
+                      case"wifi": return r(sys.setWifi(on),"WiFi "+(on?"ON":"OFF"),"WiFi "+(on?"enabled":"disabled"));
+                      case"flashlight": return r(sys.setFlash(on),"Flashlight "+(on?"ON":"OFF"),"Flashlight "+(on?"on":"off"));
+                      case"mute": return doMute(on);
+                      case"sound": return doMute(!on);
+                      case"dark_mode": return r(sys.setDarkMode(on),"Dark mode "+(on?"ON":"OFF"),"Dark mode "+(on?"enabled":"disabled"));
+                      case"rotation": return r(sys.setRotation(on),"Rotation "+(on?"ON":"OFF"),"Rotation "+(on?"enabled":"disabled"));
+                      case"dnd": return r(sys.setDnd(on),"DND "+(on?"ON":"OFF"),"Do not disturb "+(on?"enabled":"disabled"));
+                      case"location": ctx.startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); return CommandResult.ok("Location settings","Opening location settings");
+                      case"airplane": ctx.startActivity(new Intent(Settings.ACTION_AIRPLANE_MODE_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); return CommandResult.ok("Airplane mode","Opening airplane mode settings");
+                      default: return CommandResult.fail("Unknown: "+rawFeat,"I can't control "+rawFeat);
+                  }
+              }
+              private CommandResult doMute(boolean m) { return r(sys.setMute(m),m?"Muted":"Unmuted",m?"Device muted":"Device unmuted"); }
+              private CommandResult doVol(int pct) { return r(sys.setVolume(pct,AudioManager.STREAM_MUSIC),"Volume "+pct+"%","Volume set to "+pct+" percent"); }
+              private CommandResult r(boolean ok,String msg,String tts) { return ok?CommandResult.ok(msg,tts):CommandResult.fail(msg+" failed","Could not: "+msg); }
+              private String norm(String raw) { String l=raw.toLowerCase().trim(); if(SYN.containsKey(l))return SYN.get(l); for(Map.Entry<String,String>e:SYN.entrySet())if(l.contains(e.getKey()))return e.getValue(); return l; }
+              public static String helpText() { return "SYSTEM\nTurn on/off: WiFi, Bluetooth, Flashlight, Airplane mode, Dark mode, Auto rotate, Do not disturb, Location, Mute\n\nVOLUME\nSet volume to 70 percent\nIncrease/Decrease volume\nVolume max/min\n\nBRIGHTNESS\nSet brightness to 80 percent\nIncrease/Decrease brightness\nAuto brightness\n\nMEDIA\nPlay, Pause, Next, Previous\n\nNAVIGATION\nHome, Settings, Screenshot, Lock screen, Notifications\n\nAPPS\nOpen YouTube/Spotify/Chrome...\n\nCOMMUNICATION\nCall [name], Text [name]\n\nINFO\nWhat time is it?\nWhat is my battery level?"; }
+          }
+          ENDOFFILE
+
+      - name: Write SystemController.java
+        run: |
+          cat > app/src/main/java/com/voicecontrol/app/SystemController.java << 'ENDOFFILE'
+          package com.voicecontrol.app;
+          import android.app.NotificationManager; import android.app.UiModeManager; import android.bluetooth.BluetoothAdapter; import android.bluetooth.BluetoothManager;
+          import android.content.Context; import android.content.Intent; import android.content.IntentFilter; import android.hardware.camera2.CameraAccessException; import android.hardware.camera2.CameraManager;
+          import android.media.AudioManager; import android.net.Uri; import android.net.wifi.WifiManager; import android.os.BatteryManager; import android.os.Build; import android.os.VibrationEffect; import android.os.Vibrator;
+          import android.provider.Settings; import android.util.Log; import android.view.KeyEvent; import java.lang.reflect.Method;
+          public class SystemController {
+              private static final String TAG="VC_Sys";
+              private final Context ctx; private final AudioManager audio; private final WifiManager wifi; private final BluetoothAdapter bt; private final CameraManager camera; private final NotificationManager nm;
+              private String camId=null; private boolean flashOn=false;
+              public SystemController(Context ctx) {
+                  this.ctx=ctx.getApplicationContext(); this.audio=(AudioManager)ctx.getSystemService(Context.AUDIO_SERVICE); this.wifi=(WifiManager)ctx.getApplicationContext().getSystemService(Context.WIFI_SERVICE); this.nm=(NotificationManager)ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+                  BluetoothManager btm=(BluetoothManager)ctx.getSystemService(Context.BLUETOOTH_SERVICE); this.bt=btm!=null?btm.getAdapter():null;
+                  this.camera=(CameraManager)ctx.getSystemService(Context.CAMERA_SERVICE);
+                  try { if(camera!=null)camId=camera.getCameraIdList()[0]; } catch(CameraAccessException e){Log.w(TAG,"No camera");}
+              }
+              public boolean isBluetoothOn(){return bt!=null&&bt.isEnabled();}
+              public boolean setBluetooth(boolean on){
+                  if(bt==null)return false;
+                  if(Build.VERSION.SDK_INT>=Build.VERSION_CODES.S){try{ctx.startActivity(new Intent(on?"android.bluetooth.adapter.action.REQUEST_ENABLE":"android.bluetooth.adapter.action.REQUEST_DISABLE").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));return true;}catch(Exception e){ctx.startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));return true;}}
+                  else{try{return on?bt.enable():bt.disable();}catch(SecurityException e){return false;}}
+              }
+              public boolean isWifiOn(){return wifi!=null&&wifi.isWifiEnabled();}
+              @SuppressWarnings("deprecation") public boolean setWifi(boolean on){if(wifi==null)return false;if(Build.VERSION.SDK_INT>=Build.VERSION_CODES.Q){ctx.startActivity(new Intent(Settings.Panel.ACTION_WIFI).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));return true;}wifi.setWifiEnabled(on);return true;}
+              public boolean isFlashOn(){return flashOn;}
+              public boolean setFlash(boolean on){if(camera==null||camId==null)return false;try{camera.setTorchMode(camId,on);flashOn=on;return true;}catch(CameraAccessException e){return false;}}
+              public boolean setVolume(int pct,int stream){if(audio==null)return false;int max=audio.getStreamMaxVolume(stream);int raw=Math.max(0,Math.min(max,(int)(pct/100f*max)));try{audio.setStreamVolume(stream,raw,AudioManager.FLAG_SHOW_UI);return true;}catch(SecurityException e){return false;}}
+              public int getVolumePct(int stream){if(audio==null)return 50;int cur=audio.getStreamVolume(stream);int max=audio.getStreamMaxVolume(stream);return max>0?(int)(cur*100f/max):0;}
+              public boolean isMuted(){if(audio==null)return false;return audio.getRingerMode()!=AudioManager.RINGER_MODE_NORMAL;}
+              public boolean setMute(boolean mute){if(audio==null)return false;try{audio.setRingerMode(mute?AudioManager.RINGER_MODE_SILENT:AudioManager.RINGER_MODE_NORMAL);if(mute)audio.adjustStreamVolume(AudioManager.STREAM_MUSIC,AudioManager.ADJUST_MUTE,0);else audio.adjustStreamVolume(AudioManager.STREAM_MUSIC,AudioManager.ADJUST_UNMUTE,0);return true;}catch(SecurityException e){ctx.startActivity(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));return false;}}
+              public boolean setBrightness(int raw){try{Settings.System.putInt(ctx.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS_MODE,Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL);Settings.System.putInt(ctx.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS,Math.max(0,Math.min(255,raw)));return true;}catch(SecurityException e){ctx.startActivity(new Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS,Uri.parse("package:"+ctx.getPackageName())).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));return false;}}
+              public int getBrightnessPct(){try{int r=Settings.System.getInt(ctx.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS,128);return(int)(r/255f*100);}catch(Exception e){return 50;}}
+              public boolean setAutoBrightness(boolean auto){try{Settings.System.putInt(ctx.getContentResolver(),Settings.System.SCREEN_BRIGHTNESS_MODE,auto?Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC:Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL);return true;}catch(SecurityException e){return false;}}
+              public boolean setDarkMode(boolean on){try{UiModeManager um=(UiModeManager)ctx.getSystemService(Context.UI_MODE_SERVICE);if(um!=null){um.setNightMode(on?UiModeManager.MODE_NIGHT_YES:UiModeManager.MODE_NIGHT_NO);return true;}}catch(Exception e){Log.w(TAG,"Dark mode: "+e.getMessage());}ctx.startActivity(new Intent(Settings.ACTION_DISPLAY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));return true;}
+              public boolean setRotation(boolean on){try{Settings.System.putInt(ctx.getContentResolver(),Settings.System.ACCELEROMETER_ROTATION,on?1:0);return true;}catch(SecurityException e){return false;}}
+              public boolean setDnd(boolean on){if(Build.VERSION.SDK_INT>=Build.VERSION_CODES.M){if(!nm.isNotificationPolicyAccessGranted()){ctx.startActivity(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));return false;}nm.setInterruptionFilter(on?NotificationManager.INTERRUPTION_FILTER_NONE:NotificationManager.INTERRUPTION_FILTER_ALL);return true;}return false;}
+              public void media(int kc){if(audio==null)return;audio.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN,kc));audio.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_UP,kc));}
+              public void goHome(){ctx.startActivity(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));}
+              public void notifications(){try{Object sb=ctx.getSystemService("statusbar");if(sb!=null){Method m=sb.getClass().getMethod("expandNotificationsPanel");m.invoke(sb);}}catch(Exception e){Log.w(TAG,"Notifications: "+e.getMessage());}}
+              public void screenshot(){try{Runtime.getRuntime().exec("screencap -p /sdcard/vc_screenshot_"+System.currentTimeMillis()+".png");}catch(Exception e){Log.w(TAG,"Screenshot: "+e.getMessage());}}
+              public void lock(){try{android.app.admin.DevicePolicyManager dpm=(android.app.admin.DevicePolicyManager)ctx.getSystemService(Context.DEVICE_POLICY_SERVICE);if(dpm!=null)dpm.lockNow();}catch(Exception e){try{Runtime.getRuntime().exec("input keyevent KEYCODE_POWER");}catch(Exception ex){}}}
+              public boolean launch(String pkg){try{Intent i=ctx.getPackageManager().getLaunchIntentForPackage(pkg);if(i!=null){i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);ctx.startActivity(i);return true;}}catch(Exception e){}return false;}
+              public boolean launchByName(String name){Intent main=new Intent(Intent.ACTION_MAIN,null).addCategory(Intent.CATEGORY_LAUNCHER);for(android.content.pm.ResolveInfo info:ctx.getPackageManager().queryIntentActivities(main,0)){if(info.loadLabel(ctx.getPackageManager()).toString().toLowerCase().contains(name.toLowerCase())){Intent i=new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setClassName(info.activityInfo.packageName,info.activityInfo.name).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);ctx.startActivity(i);return true;}}return false;}
+              public void call(String contact){try{String num=contact.replaceAll("[^0-9+]","");ctx.startActivity(new Intent(Intent.ACTION_DIAL,Uri.parse("tel:"+(num.isEmpty()?Uri.encode(contact):num))).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));}catch(Exception e){}}
+              public void sms(String contact){try{ctx.startActivity(new Intent(Intent.ACTION_VIEW).setData(Uri.parse("sms:"+Uri.encode(contact))).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));}catch(Exception e){}}
+              public int getBattery(){Intent b=ctx.registerReceiver(null,new IntentFilter(Intent.ACTION_BATTERY_CHANGED));if(b==null)return-1;int l=b.getIntExtra(BatteryManager.EXTRA_LEVEL,-1);int s=b.getIntExtra(BatteryManager.EXTRA_SCALE,-1);return(int)(l/(float)s*100);}
+              public boolean isCharging(){Intent b=ctx.registerReceiver(null,new IntentFilter(Intent.ACTION_BATTERY_CHANGED));if(b==null)return false;int st=b.getIntExtra(BatteryManager.EXTRA_STATUS,-1);return st==BatteryManager.BATTERY_STATUS_CHARGING||st==BatteryManager.BATTERY_STATUS_FULL;}
+              public void vibrate(long ms){try{Vibrator v=(Vibrator)ctx.getSystemService(Context.VIBRATOR_SERVICE);if(v==null)return;if(Build.VERSION.SDK_INT>=Build.VERSION_CODES.O)v.vibrate(VibrationEffect.createOneShot(ms,VibrationEffect.DEFAULT_AMPLITUDE));else v.vibrate(ms);}catch(Exception ignored){}}
+          }
+          ENDOFFILE
+
+      - name: Write remaining Java files
+        run: |
+          cat > app/src/main/java/com/voicecontrol/app/TtsManager.java << 'ENDOFFILE'
+          package com.voicecontrol.app;
+          import android.content.Context; import android.speech.tts.TextToSpeech; import java.util.Locale;
+          public class TtsManager {
+              private TextToSpeech tts; private boolean ready=false;
+              public TtsManager(Context ctx){tts=new TextToSpeech(ctx,status->{if(status==TextToSpeech.SUCCESS){tts.setLanguage(Locale.getDefault());tts.setSpeechRate(1.0f);ready=true;}});}
+              public void speak(String text){if(!ready||text==null||text.isEmpty())return;tts.speak(text,TextToSpeech.QUEUE_FLUSH,null,"vc"+System.currentTimeMillis());}
+              public void shutdown(){if(tts!=null){tts.stop();tts.shutdown();tts=null;ready=false;}}
+          }
+          ENDOFFILE
+
+          cat > app/src/main/java/com/voicecontrol/app/HistoryManager.java << 'ENDOFFILE'
+          package com.voicecontrol.app;
+          import android.content.ContentValues; import android.content.Context; import android.database.Cursor; import android.database.sqlite.SQLiteDatabase; import android.database.sqlite.SQLiteOpenHelper;
+          import java.text.SimpleDateFormat; import java.util.*; import java.util.Date;
+          public class HistoryManager extends SQLiteOpenHelper {
+              private static final String DB="vc_history.db",T="history"; private static final int VER=1;
+              public HistoryManager(Context ctx){super(ctx,DB,null,VER);}
+              @Override public void onCreate(SQLiteDatabase db){db.execSQL("CREATE TABLE "+T+" (id INTEGER PRIMARY KEY AUTOINCREMENT,cmd TEXT,result TEXT,ok INTEGER,ts TEXT)");}
+              @Override public void onUpgrade(SQLiteDatabase db,int a,int b){db.execSQL("DROP TABLE IF EXISTS "+T);onCreate(db);}
+              public void add(String cmd,String result,boolean ok){try{ContentValues v=new ContentValues();v.put("cmd",cmd);v.put("result",result);v.put("ok",ok?1:0);v.put("ts",new SimpleDateFormat("yyyy-MM-dd HH:mm:ss",Locale.getDefault()).format(new Date()));getWritableDatabase().insert(T,null,v);}catch(Exception ignored){}}
+              public List<Entry> recent(int limit){List<Entry> list=new ArrayList<>();try(Cursor c=getReadableDatabase().query(T,null,null,null,null,null,"ts DESC",""+limit)){while(c.moveToNext())list.add(new Entry(c.getString(c.getColumnIndexOrThrow("cmd")),c.getString(c.getColumnIndexOrThrow("result")),c.getInt(c.getColumnIndexOrThrow("ok"))==1,c.getString(c.getColumnIndexOrThrow("ts"))));}catch(Exception ignored){}return list;}
+              public int total(){try(Cursor c=getReadableDatabase().rawQuery("SELECT COUNT(*) FROM "+T,null)){return c.moveToFirst()?c.getInt(0):0;}catch(Exception e){return 0;}}
+              public int success(){try(Cursor c=getReadableDatabase().rawQuery("SELECT COUNT(*) FROM "+T+" WHERE ok=1",null)){return c.moveToFirst()?c.getInt(0):0;}catch(Exception e){return 0;}}
+              public void clear(){try{getWritableDatabase().execSQL("DELETE FROM "+T);}catch(Exception ignored){}}
+              public static class Entry{public final String cmd,result,ts;public final boolean ok;Entry(String cmd,String result,boolean ok,String ts){this.cmd=cmd;this.result=result;this.ok=ok;this.ts=ts;}}
+          }
+          ENDOFFILE
+
+          cat > app/src/main/java/com/voicecontrol/app/BootReceiver.java << 'ENDOFFILE'
+          package com.voicecontrol.app;
+          import android.content.BroadcastReceiver; import android.content.Context; import android.content.Intent; import android.content.SharedPreferences; import android.os.Build;
+          public class BootReceiver extends BroadcastReceiver {
+              @Override public void onReceive(Context ctx,Intent intent){SharedPreferences p=ctx.getSharedPreferences("vcprefs",Context.MODE_PRIVATE);if(p.getBoolean("continuous",false)){Intent svc=new Intent(ctx,VoiceListenerService.class).setAction(VoiceListenerService.ACTION_START);if(Build.VERSION.SDK_INT>=Build.VERSION_CODES.O)ctx.startForegroundService(svc);else ctx.startService(svc);}}
+          }
+          ENDOFFILE
+
+          cat > app/src/main/java/com/voicecontrol/app/SettingsActivity.java << 'ENDOFFILE'
+          package com.voicecontrol.app;
+          import android.content.SharedPreferences; import android.os.Bundle; import android.view.MenuItem; import android.widget.SeekBar; import android.widget.TextView;
+          import androidx.annotation.NonNull; import androidx.appcompat.app.AppCompatActivity; import androidx.appcompat.widget.Toolbar; import com.google.android.material.switchmaterial.SwitchMaterial;
+          public class SettingsActivity extends AppCompatActivity {
+              private SharedPreferences p;
+              @Override protected void onCreate(Bundle b){super.onCreate(b);setContentView(R.layout.activity_settings);Toolbar tb=findViewById(R.id.toolbar);setSupportActionBar(tb);if(getSupportActionBar()!=null){getSupportActionBar().setDisplayHomeAsUpEnabled(true);getSupportActionBar().setTitle("Settings");}p=getSharedPreferences("vcprefs",MODE_PRIVATE);bind(R.id.switch_tts,"tts",true);bind(R.id.switch_haptic,"haptic",true);bind(R.id.switch_boot,"boot_auto",false);bind(R.id.switch_confirm,"confirm",true);SeekBar sb=findViewById(R.id.seek_sensitivity);TextView tv=findViewById(R.id.tv_sensitivity_value);int sv=p.getInt("sensitivity",50);sb.setProgress(sv);tv.setText(sv+"%");sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){@Override public void onProgressChanged(SeekBar s,int v,boolean u){tv.setText(v+"%");p.edit().putInt("sensitivity",v).apply();}@Override public void onStartTrackingTouch(SeekBar s){}@Override public void onStopTrackingTouch(SeekBar s){}});}
+              private void bind(int id,String key,boolean def){SwitchMaterial sw=findViewById(id);sw.setChecked(p.getBoolean(key,def));sw.setOnCheckedChangeListener((v,on)->p.edit().putBoolean(key,on).apply());}
+              @Override public boolean onOptionsItemSelected(@NonNull MenuItem i){if(i.getItemId()==android.R.id.home){finish();return true;}return super.onOptionsItemSelected(i);}
+          }
+          ENDOFFILE
+
+          cat > app/src/main/java/com/voicecontrol/app/CommandHistoryActivity.java << 'ENDOFFILE'
+          package com.voicecontrol.app;
+          import android.os.Bundle; import android.view.*; import android.widget.TextView;
+          import androidx.annotation.NonNull; import androidx.appcompat.app.AppCompatActivity; import androidx.appcompat.widget.Toolbar; import androidx.recyclerview.widget.LinearLayoutManager; import androidx.recyclerview.widget.RecyclerView;
+          import com.google.android.material.button.MaterialButton; import com.google.android.material.card.MaterialCardView; import java.util.List;
+          public class CommandHistoryActivity extends AppCompatActivity {
+              private HistoryManager hm; private RecyclerView rv; private TextView tvStats,tvEmpty;
+              @Override protected void onCreate(Bundle b){super.onCreate(b);setContentView(R.layout.activity_history);Toolbar tb=findViewById(R.id.toolbar);setSupportActionBar(tb);if(getSupportActionBar()!=null){getSupportActionBar().setDisplayHomeAsUpEnabled(true);getSupportActionBar().setTitle("Command History");}hm=new HistoryManager(this);rv=findViewById(R.id.recycler_history);tvStats=findViewById(R.id.tv_stats);tvEmpty=findViewById(R.id.tv_empty);rv.setLayoutManager(new LinearLayoutManager(this));MaterialButton btnClear=findViewById(R.id.btn_clear_history);btnClear.setOnClickListener(v->{hm.clear();load();});load();}
+              private void load(){List<HistoryManager.Entry> list=hm.recent(100);int tot=hm.total(),suc=hm.success();tvStats.setText("Total: "+tot+"  |  Success: "+(tot>0?(suc*100/tot):0)+"%");if(list.isEmpty()){rv.setVisibility(View.GONE);tvEmpty.setVisibility(View.VISIBLE);}else{rv.setVisibility(View.VISIBLE);tvEmpty.setVisibility(View.GONE);rv.setAdapter(new Adapter(list));}}
+              @Override public boolean onOptionsItemSelected(@NonNull MenuItem i){if(i.getItemId()==android.R.id.home){finish();return true;}return super.onOptionsItemSelected(i);}
+              static class Adapter extends RecyclerView.Adapter<Adapter.VH>{
+                  private final List<HistoryManager.Entry> items;
+                  Adapter(List<HistoryManager.Entry> items){this.items=items;}
+                  @NonNull @Override public VH onCreateViewHolder(@NonNull ViewGroup p,int t){return new VH(LayoutInflater.from(p.getContext()).inflate(R.layout.item_history,p,false));}
+                  @Override public void onBindViewHolder(@NonNull VH h,int pos){HistoryManager.Entry e=items.get(pos);h.cmd.setText("\""+e.cmd+"\"");h.result.setText(e.result);h.time.setText(e.ts);h.status.setText(e.ok?"OK":"FAIL");h.card.setCardBackgroundColor(h.itemView.getContext().getColor(e.ok?R.color.colorSuccessBg:R.color.colorErrorBg));}
+                  @Override public int getItemCount(){return items.size();}
+                  static class VH extends RecyclerView.ViewHolder{MaterialCardView card;TextView cmd,result,time,status;VH(View v){super(v);card=v.findViewById(R.id.card_history_item);cmd=v.findViewById(R.id.tv_history_command);result=v.findViewById(R.id.tv_history_result);time=v.findViewById(R.id.tv_history_time);status=v.findViewById(R.id.tv_history_status);}}
+              }
+          }
+          ENDOFFILE
+
+          cat > app/src/main/java/com/voicecontrol/app/VoiceListenerService.java << 'ENDOFFILE'
+          package com.voicecontrol.app;
+          import android.app.*; import android.content.Intent; import android.os.*; import android.speech.*; import android.util.Log;
+          import androidx.annotation.Nullable; import androidx.core.app.NotificationCompat; import java.util.*; import java.util.Locale;
+          public class VoiceListenerService extends Service implements RecognitionListener {
+              public static final String ACTION_START="vc.START",ACTION_STOP="vc.STOP";
+              private static final String CH_ID="vc_ch"; private static final int NID=9001; private static final long RMS=800;
+              private SpeechRecognizer sr; private SystemController sys; private CommandProcessor cmd; private TtsManager tts;
+              private boolean alive=false,listening=false; private int count=0;
+              private final Handler handler=new Handler(Looper.getMainLooper());
+              @Override public void onCreate(){super.onCreate();sys=new SystemController(this);cmd=new CommandProcessor(this,sys);tts=new TtsManager(this);mkCh();}
+              @Override public int onStartCommand(Intent intent,int flags,int startId){String a=intent==null?ACTION_START:intent.getAction();if(ACTION_STOP.equals(a)){alive=false;stopSelf();return START_NOT_STICKY;}alive=true;startForeground(NID,notif("Listening..."));listen();return START_STICKY;}
+              private void listen(){if(!alive||listening)return;handler.post(()->{try{if(sr!=null)sr.destroy();sr=SpeechRecognizer.createSpeechRecognizer(this);sr.setRecognitionListener(this);Intent i=new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);i.putExtra(RecognizerIntent.EXTRA_LANGUAGE,Locale.getDefault());i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS,1);if(Build.VERSION.SDK_INT>=33)i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE,true);i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,1500L);sr.startListening(i);listening=true;}catch(Exception e){restart(3000);}});}
+              private void restart(long d){if(alive)handler.postDelayed(this::listen,d);}
+              @Override public void onReadyForSpeech(Bundle p){}@Override public void onBeginningOfSpeech(){}@Override public void onRmsChanged(float r){}@Override public void onBufferReceived(byte[] b){}@Override public void onPartialResults(Bundle p){}@Override public void onEvent(int t,Bundle p){}
+              @Override public void onEndOfSpeech(){listening=false;}
+              @Override public void onError(int err){listening=false;boolean mild=err==SpeechRecognizer.ERROR_NO_MATCH||err==SpeechRecognizer.ERROR_SPEECH_TIMEOUT||err==SpeechRecognizer.ERROR_RECOGNIZER_BUSY;restart(mild?RMS:RMS*4);}
+              @Override public void onResults(Bundle results){listening=false;ArrayList<String> m=results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);if(m!=null&&!m.isEmpty()){String text=m.get(0);CommandResult r=cmd.process(text);count++;if(r!=null){tts.speak(r.getTts());sys.vibrate(60);}}restart(RMS);}
+              private void mkCh(){if(Build.VERSION.SDK_INT>=Build.VERSION_CODES.O){NotificationChannel ch=new NotificationChannel(CH_ID,"Voice Control",NotificationManager.IMPORTANCE_LOW);ch.setSound(null,null);((NotificationManager)getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(ch);}}
+              private Notification notif(String text){PendingIntent pi=PendingIntent.getActivity(this,0,new Intent(this,MainActivity.class),PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);return new NotificationCompat.Builder(this,CH_ID).setContentTitle("Voice Control").setContentText(text).setSmallIcon(R.drawable.ic_mic_notification).setContentIntent(pi).setOngoing(true).setSilent(true).setPriority(NotificationCompat.PRIORITY_LOW).build();}
+              @Override public void onDestroy(){alive=false;if(sr!=null){sr.destroy();sr=null;}if(tts!=null){tts.shutdown();tts=null;}handler.removeCallbacksAndMessages(null);super.onDestroy();}
+              @Nullable @Override public IBinder onBind(Intent i){return null;}
+          }
+          ENDOFFILE
+
+      - name: Write all XML resources
+        run: |
+          # Colors
+          cat > app/src/main/res/values/colors.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="colorPrimary">#1A237E</color>
+              <color name="colorPrimaryDark">#0D1462</color>
+              <color name="colorPrimaryLight">#9FA8DA</color>
+              <color name="colorAccent">#FF4081</color>
+              <color name="colorBackground">#F5F5F5</color>
+              <color name="colorSurface">#FFFFFF</color>
+              <color name="colorSurface2">#F0F0FF</color>
+              <color name="white">#FFFFFF</color>
+              <color name="colorTextPrimary">#212121</color>
+              <color name="colorTextSecondary">#757575</color>
+              <color name="colorListening">#1A237E</color>
+              <color name="colorIdle">#455A64</color>
+              <color name="colorActive">#388E3C</color>
+              <color name="colorInactive">#9E9E9E</color>
+              <color name="colorWarning">#E65100</color>
+              <color name="colorSuccessBg">#E8F5E9</color>
+              <color name="colorErrorBg">#FFEBEE</color>
+          </resources>
+          EOF
+
+          # Strings
+          cat > app/src/main/res/values/strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Voice Control</string>
+          </resources>
+          EOF
+
+          # Styles
+          cat > app/src/main/res/values/styles.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="Theme.MaterialComponents.Light.NoActionBar">
+                  <item name="colorPrimary">@color/colorPrimary</item>
+                  <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
+                  <item name="colorAccent">@color/colorAccent</item>
+                  <item name="android:statusBarColor">@color/colorPrimaryDark</item>
+                  <item name="android:windowBackground">@color/colorBackground</item>
+              </style>
+          </resources>
+          EOF
+
+          # Menu
+          cat > app/src/main/res/menu/main_menu.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <menu xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+              <item android:id="@+id/menu_history" android:title="History" android:icon="@drawable/ic_history" app:showAsAction="ifRoom"/>
+              <item android:id="@+id/menu_clear" android:title="Clear" app:showAsAction="never"/>
+              <item android:id="@+id/menu_settings" android:title="Settings" app:showAsAction="never"/>
+              <item android:id="@+id/menu_help" android:title="Help" app:showAsAction="never"/>
+          </menu>
+          EOF
+
+          # Animation
+          cat > app/src/main/res/anim/pulse.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <set xmlns:android="http://schemas.android.com/apk/res/android">
+              <scale android:fromXScale="1.0" android:toXScale="1.3" android:fromYScale="1.0" android:toYScale="1.3" android:pivotX="50%" android:pivotY="50%" android:duration="700" android:repeatMode="reverse" android:repeatCount="infinite"/>
+              <alpha android:fromAlpha="1.0" android:toAlpha="0.5" android:duration="700" android:repeatMode="reverse" android:repeatCount="infinite"/>
+          </set>
+          EOF
+
+          # Mic ring background
+          cat > app/src/main/res/drawable/mic_ring_bg.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+              <solid android:color="#331A237E"/>
+              <stroke android:width="3dp" android:color="#3F51B5"/>
+          </shape>
+          EOF
+
+          # All icons as vector drawables
+          for icon in ic_mic ic_mic_active ic_mic_notification; do
+          cat > app/src/main/res/drawable/${icon}.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M12,14c1.66,0 2.99,-1.34 2.99,-3L15,5c0,-1.66 -1.34,-3 -3,-3S9,3.34 9,5v6c0,1.66 1.34,3 3,3zM17.3,11c0,3 -2.54,5.1 -5.3,5.1S6.7,14 6.7,11H5c0,3.41 2.72,6.23 6,6.72V21h2v-3.28c3.28,-0.48 6,-3.3 6,-6.72h-1.7z"/>
+          </vector>
+          EOF
+          done
+
+          cat > app/src/main/res/drawable/ic_waveform.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M7,18H5V6h2v12zM11,21H9V3h2v18zM15,18h-2V6h2v12zM19,21h-2V3h2v18z"/>
+          </vector>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_settings.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M19.14,12.94c0.04,-0.3 0.06,-0.61 0.06,-0.94c0,-0.32 -0.02,-0.64 -0.07,-0.94l2.03,-1.58c0.18,-0.14 0.23,-0.41 0.12,-0.61l-1.92,-3.32c-0.12,-0.22 -0.37,-0.29 -0.59,-0.22l-2.39,0.96c-0.5,-0.38 -1.03,-0.7 -1.62,-0.94L14.4,2.81c-0.04,-0.24 -0.24,-0.41 -0.48,-0.41h-3.84c-0.24,0 -0.43,0.17 -0.47,0.41L9.25,5.35C8.66,5.59 8.12,5.92 7.63,6.29L5.24,5.33c-0.22,-0.08 -0.47,0 -0.59,0.22L2.74,8.87C2.62,9.08 2.66,9.34 2.86,9.48l2.03,1.58C4.84,11.36 4.8,11.69 4.8,12s0.02,0.64 0.07,0.94l-2.03,1.58c-0.18,0.14 -0.23,0.41 -0.12,0.61l1.92,3.32c0.12,0.22 0.37,0.29 0.59,0.22l2.39,-0.96c0.5,0.38 1.03,0.7 1.62,0.94l0.36,2.54c0.05,0.24 0.24,0.41 0.48,0.41h3.84c0.24,0 0.44,-0.17 0.47,-0.41l0.36,-2.54c0.59,-0.24 1.13,-0.56 1.62,-0.94l2.39,0.96c0.22,0.08 0.47,0 0.59,-0.22l1.92,-3.32c0.12,-0.22 0.07,-0.47 -0.12,-0.61L19.14,12.94zM12,15.6c-1.98,0 -3.6,-1.62 -3.6,-3.6s1.62,-3.6 3.6,-3.6s3.6,1.62 3.6,3.6S13.98,15.6 12,15.6z"/>
+          </vector>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_history.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M13,3c-4.97,0 -9,4.03 -9,9H1l3.89,3.89 0.07,0.14L9,12H6c0,-3.87 3.13,-7 7,-7s7,3.13 7,7 -3.13,7 -7,7c-1.93,0 -3.68,-0.79 -4.94,-2.06l-1.42,1.42C8.27,19.99 10.51,21 13,21c4.97,0 9,-4.03 9,-9s-4.03,-9 -9,-9zM12,8v5l4.28,2.54 0.72,-1.21 -3.5,-2.08V8H12z"/>
+          </vector>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_bluetooth.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M17.71,7.71L12,2h-1v7.59L6.41,5 5,6.41 10.59,12 5,17.59 6.41,19 11,14.41V22h1l5.71,-5.71 -4.3,-4.29 4.3,-4.29zM13,5.83l1.88,1.88L13,9.59V5.83zM14.88,16.29L13,18.17v-3.76l1.88,1.88z"/>
+          </vector>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_wifi.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M1,9l2,2c4.97,-4.97 13.03,-4.97 18,0l2,-2C16.93,2.93 7.08,2.93 1,9zM9,17l3,3 3,-3c-1.65,-1.66 -4.34,-1.66 -6,0zM5,13l2,2c2.76,-2.76 7.24,-2.76 10,0l2,-2C15.14,9.14 8.87,9.14 5,13z"/>
+          </vector>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_flash.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M7,2v11h3v9l7,-12h-4l4,-8z"/>
+          </vector>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_volume.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M3,9v6h4l5,5V4L7,9H3zM16.5,12c0,-1.77 -1.02,-3.29 -2.5,-4.03v8.05c1.48,-0.73 2.5,-2.25 2.5,-4.02z"/>
+          </vector>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_stop.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M6,6h12v12H6z"/>
+          </vector>
+          EOF
+
+          # Launcher icon (same for all densities)
+          for density in hdpi mdpi xhdpi xxhdpi xxxhdpi; do
+          cat > app/src/main/res/mipmap-${density}/ic_launcher.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/colorPrimary"/>
+              <foreground android:drawable="@drawable/ic_mic"/>
+          </adaptive-icon>
+          EOF
+          cp app/src/main/res/mipmap-${density}/ic_launcher.xml app/src/main/res/mipmap-${density}/ic_launcher_round.xml
+          done
+
+      - name: Write layout XML files
+        run: |
+          cat > app/src/main/res/layout/activity_main.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <androidx.coordinatorlayout.widget.CoordinatorLayout xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto" android:layout_width="match_parent" android:layout_height="match_parent" android:background="@color/colorBackground">
+              <com.google.android.material.appbar.AppBarLayout android:layout_width="match_parent" android:layout_height="wrap_content">
+                  <androidx.appcompat.widget.Toolbar android:id="@+id/toolbar" android:layout_width="match_parent" android:layout_height="?attr/actionBarSize" android:background="@color/colorPrimary" app:titleTextColor="@color/white" app:subtitleTextColor="@color/colorPrimaryLight"/>
+              </com.google.android.material.appbar.AppBarLayout>
+              <androidx.core.widget.NestedScrollView android:layout_width="match_parent" android:layout_height="match_parent" app:layout_behavior="@string/appbar_scrolling_view_behavior" android:padding="12dp" android:clipToPadding="false">
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:gravity="center_horizontal">
+                      <FrameLayout android:layout_width="130dp" android:layout_height="130dp" android:layout_marginTop="20dp" android:layout_marginBottom="12dp">
+                          <View android:layout_width="130dp" android:layout_height="130dp" android:background="@drawable/mic_ring_bg" android:layout_gravity="center"/>
+                          <ImageView android:id="@+id/iv_waveform" android:layout_width="70dp" android:layout_height="70dp" android:layout_gravity="center" android:src="@drawable/ic_waveform" android:contentDescription="waveform"/>
+                      </FrameLayout>
+                      <com.google.android.material.card.MaterialCardView android:id="@+id/card_status" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="10dp" app:cardCornerRadius="14dp" app:cardElevation="4dp" app:cardBackgroundColor="@color/colorIdle">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="14dp">
+                              <TextView android:id="@+id/tv_status" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Tap mic to start" android:textSize="16sp" android:textStyle="bold" android:gravity="center" android:textColor="@color/white"/>
+                              <TextView android:id="@+id/tv_last_cmd" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="" android:textSize="12sp" android:gravity="center" android:textColor="@color/colorPrimaryLight" android:layout_marginTop="4dp" android:maxLines="1" android:ellipsize="end"/>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                      <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="10dp" app:cardCornerRadius="12dp" app:cardElevation="2dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="10dp">
+                              <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Quick Controls" android:textSize="11sp" android:textStyle="bold" android:textColor="@color/colorTextSecondary" android:layout_marginBottom="6dp"/>
+                              <com.google.android.material.chip.ChipGroup android:layout_width="match_parent" android:layout_height="wrap_content">
+                                  <com.google.android.material.chip.Chip android:id="@+id/chip_bt" style="@style/Widget.MaterialComponents.Chip.Action" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="BT: OFF" app:chipIcon="@drawable/ic_bluetooth"/>
+                                  <com.google.android.material.chip.Chip android:id="@+id/chip_wifi" style="@style/Widget.MaterialComponents.Chip.Action" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="WiFi: OFF" app:chipIcon="@drawable/ic_wifi"/>
+                                  <com.google.android.material.chip.Chip android:id="@+id/chip_flash" style="@style/Widget.MaterialComponents.Chip.Action" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Flash: OFF" app:chipIcon="@drawable/ic_flash"/>
+                                  <com.google.android.material.chip.Chip android:id="@+id/chip_mute" style="@style/Widget.MaterialComponents.Chip.Action" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Sound: ON" app:chipIcon="@drawable/ic_volume"/>
+                              </com.google.android.material.chip.ChipGroup>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                      <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="10dp" app:cardCornerRadius="12dp" app:cardElevation="2dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:padding="14dp" android:gravity="center_vertical">
+                              <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:orientation="vertical">
+                                  <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Always-On Background Listening" android:textSize="13sp" android:textStyle="bold"/>
+                                  <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Listens even when app is closed" android:textSize="11sp" android:textColor="@color/colorTextSecondary"/>
+                              </LinearLayout>
+                              <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switch_continuous" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                      <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="10dp" app:cardCornerRadius="12dp" app:cardElevation="2dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="12dp">
+                              <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Command Log" android:textSize="11sp" android:textStyle="bold" android:textColor="@color/colorTextSecondary" android:layout_marginBottom="6dp"/>
+                              <ScrollView android:id="@+id/scroll_output" android:layout_width="match_parent" android:layout_height="220dp">
+                                  <TextView android:id="@+id/tv_output" android:layout_width="match_parent" android:layout_height="wrap_content" android:fontFamily="monospace" android:textSize="12sp" android:lineSpacingExtra="3dp"/>
+                              </ScrollView>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                      <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="90dp" app:cardCornerRadius="10dp" app:cardElevation="1dp" app:cardBackgroundColor="@color/colorSurface2">
+                          <TextView android:id="@+id/tv_device_info" android:layout_width="match_parent" android:layout_height="wrap_content" android:padding="10dp" android:fontFamily="monospace" android:textSize="10sp" android:textColor="@color/colorTextSecondary"/>
+                      </com.google.android.material.card.MaterialCardView>
+                  </LinearLayout>
+              </androidx.core.widget.NestedScrollView>
+              <com.google.android.material.floatingactionbutton.FloatingActionButton android:id="@+id/fab_mic" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_gravity="bottom|center_horizontal" android:layout_margin="20dp" android:src="@drawable/ic_mic" android:contentDescription="Mic" app:fabSize="large" app:backgroundTint="@color/colorAccent" app:tint="@color/white" app:elevation="12dp"/>
+          </androidx.coordinatorlayout.widget.CoordinatorLayout>
+          EOF
+
+          cat > app/src/main/res/layout/activity_history.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto" android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical" android:background="@color/colorBackground">
+              <androidx.appcompat.widget.Toolbar android:id="@+id/toolbar" android:layout_width="match_parent" android:layout_height="?attr/actionBarSize" android:background="@color/colorPrimary" app:titleTextColor="@color/white"/>
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:padding="14dp" android:gravity="center_vertical">
+                  <TextView android:id="@+id/tv_stats" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:textSize="13sp" android:text="Loading..."/>
+                  <com.google.android.material.button.MaterialButton android:id="@+id/btn_clear_history" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Clear" style="@style/Widget.MaterialComponents.Button.OutlinedButton"/>
+              </LinearLayout>
+              <TextView android:id="@+id/tv_empty" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="No history yet." android:gravity="center" android:padding="48dp" android:visibility="gone" android:textColor="@color/colorTextSecondary"/>
+              <androidx.recyclerview.widget.RecyclerView android:id="@+id/recycler_history" android:layout_width="match_parent" android:layout_height="match_parent" android:padding="8dp" android:clipToPadding="false"/>
+          </LinearLayout>
+          EOF
+
+          cat > app/src/main/res/layout/item_history.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <com.google.android.material.card.MaterialCardView xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto" android:id="@+id/card_history_item" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_margin="4dp" app:cardCornerRadius="8dp" app:cardElevation="2dp">
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:padding="12dp" android:gravity="center_vertical">
+                  <TextView android:id="@+id/tv_history_status" android:layout_width="40dp" android:layout_height="wrap_content" android:textSize="16sp" android:text="OK"/>
+                  <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:orientation="vertical" android:layout_marginStart="8dp">
+                      <TextView android:id="@+id/tv_history_command" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="14sp" android:textStyle="bold"/>
+                      <TextView android:id="@+id/tv_history_result" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="12sp" android:textColor="@color/colorTextSecondary"/>
+                      <TextView android:id="@+id/tv_history_time" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="10sp" android:textColor="@color/colorTextSecondary"/>
+                  </LinearLayout>
+              </LinearLayout>
+          </com.google.android.material.card.MaterialCardView>
+          EOF
+
+          cat > app/src/main/res/layout/activity_settings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto" android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical" android:background="@color/colorBackground">
+              <androidx.appcompat.widget.Toolbar android:id="@+id/toolbar" android:layout_width="match_parent" android:layout_height="?attr/actionBarSize" android:background="@color/colorPrimary" app:titleTextColor="@color/white"/>
+              <ScrollView android:layout_width="match_parent" android:layout_height="match_parent" android:padding="14dp">
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical">
+                      <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="10dp" app:cardCornerRadius="12dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:padding="14dp" android:gravity="center_vertical">
+                              <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="Voice Feedback (TTS)" android:textStyle="bold"/>
+                              <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switch_tts" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                      <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="10dp" app:cardCornerRadius="12dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:padding="14dp" android:gravity="center_vertical">
+                              <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="Haptic Feedback" android:textStyle="bold"/>
+                              <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switch_haptic" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                      <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="10dp" app:cardCornerRadius="12dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:padding="14dp" android:gravity="center_vertical">
+                              <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="Auto-Start on Boot" android:textStyle="bold"/>
+                              <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switch_boot" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                      <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="10dp" app:cardCornerRadius="12dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:padding="14dp" android:gravity="center_vertical">
+                              <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="Confirm Commands" android:textStyle="bold"/>
+                              <com.google.android.material.switchmaterial.SwitchMaterial android:id="@+id/switch_confirm" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                      <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="10dp" app:cardCornerRadius="12dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="14dp">
+                              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal">
+                                  <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="Mic Sensitivity" android:textStyle="bold"/>
+                                  <TextView android:id="@+id/tv_sensitivity_value" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="50%" android:textColor="@color/colorAccent"/>
+                              </LinearLayout>
+                              <SeekBar android:id="@+id/seek_sensitivity" android:layout_width="match_parent" android:layout_height="wrap_content" android:max="100" android:progress="50" android:layout_marginTop="8dp"/>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                  </LinearLayout>
+              </ScrollView>
+          </LinearLayout>
+          EOF
+
+      - name: Write Gradle build files
+        run: |
+          cat > settings.gradle << 'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "VoiceControl"
+          include ':app'
+          EOF
+
+          cat > build.gradle << 'EOF'
+          plugins { id 'com.android.application' version '8.5.0' apply false }
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.enableJetifier=true
+          EOF
+
+          cat > app/build.gradle << 'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.voicecontrol.app'
+              compileSdk 34
+              defaultConfig { applicationId "com.voicecontrol.app"; minSdk 26; targetSdk 34; versionCode 1; versionName "1.0" }
+              buildTypes { release { minifyEnabled false } }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+          }
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.7.0'
+              implementation 'androidx.core:core:1.13.1'
+              implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+              implementation 'androidx.recyclerview:recyclerview:1.3.2'
+              implementation 'com.google.android.material:material:1.12.0'
+              implementation 'androidx.lifecycle:lifecycle-service:2.8.6'
+          }
+          EOF
+
+          cat > app/proguard-rules.pro << 'EOF'
+          -keep class com.voicecontrol.app.** { *; }
+          -keep class android.speech.** { *; }
+          -dontwarn android.bluetooth.**
+          EOF
+
+      - name: Set up Gradle wrapper
+        run: |
+          mkdir -p gradle/wrapper
+          cat > gradle/wrapper/gradle-wrapper.properties << 'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+          wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip -O /tmp/gradle.zip
+          cd /tmp && unzip -q gradle.zip
+          /tmp/gradle-8.7/bin/gradle wrapper --project-dir $GITHUB_WORKSPACE
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceControl-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      - name: Show success
+        run: |
+          echo "================================"
+          echo "  APK BUILT SUCCESSFULLY!"
+          echo "================================"
+          ls -lh app/build/outputs/apk/debug/
+          echo ""
+          echo "Download from: Actions tab > This run > Artifacts > VoiceControl-APK"
