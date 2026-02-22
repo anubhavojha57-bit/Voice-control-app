@@ -1,0 +1,314 @@
+name: Build Voice Control APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Create full Android project structure
+        run: |
+          mkdir -p app/src/main/java/com/voicecontrol/app
+          mkdir -p app/src/main/res/layout
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/menu
+          mkdir -p app/src/main/res/anim
+          mkdir -p app/src/main/res/mipmap-hdpi
+          mkdir -p app/src/main/res/mipmap-mdpi
+          mkdir -p app/src/main/res/mipmap-xhdpi
+          mkdir -p app/src/main/res/mipmap-xxhdpi
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          mkdir -p gradle/wrapper
+
+      - name: Write AndroidManifest.xml
+        run: |
+          cat > app/src/main/AndroidManifest.xml << 'ENDOFFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools"
+              package="com.voicecontrol.app">
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <uses-permission android:name="android.permission.BLUETOOTH"/>
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN"/>
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+              <uses-permission android:name="android.permission.WRITE_SETTINGS" tools:ignore="ProtectedPermissions"/>
+              <uses-permission android:name="android.permission.CAMERA"/>
+              <uses-permission android:name="android.permission.FLASHLIGHT"/>
+              <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+              <uses-permission android:name="android.permission.CALL_PHONE"/>
+              <uses-permission android:name="android.permission.SEND_SMS"/>
+              <uses-permission android:name="android.permission.READ_CONTACTS"/>
+              <uses-feature android:name="android.hardware.microphone" android:required="true"/>
+              <uses-feature android:name="android.hardware.camera.flash" android:required="false"/>
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/AppTheme"
+                  android:hardwareAccelerated="true"
+                  android:largeHeap="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".SettingsActivity" android:exported="false" android:parentActivityName=".MainActivity"/>
+                  <activity android:name=".CommandHistoryActivity" android:exported="false" android:parentActivityName=".MainActivity"/>
+                  <service android:name=".VoiceListenerService" android:exported="false" android:foregroundServiceType="microphone" android:enabled="true"/>
+                  <receiver android:name=".BootReceiver" android:exported="true" android:enabled="true">
+                      <intent-filter android:priority="999">
+                          <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                          <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          ENDOFFILE
+
+      - name: Write MainActivity.java
+        run: |
+          cat > app/src/main/java/com/voicecontrol/app/MainActivity.java << 'ENDOFFILE'
+          package com.voicecontrol.app;
+          import android.Manifest;
+          import android.app.AlertDialog;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.speech.RecognitionListener;
+          import android.speech.RecognizerIntent;
+          import android.speech.SpeechRecognizer;
+          import android.view.Menu;
+          import android.view.MenuItem;
+          import android.view.View;
+          import android.view.animation.Animation;
+          import android.view.animation.AnimationUtils;
+          import android.widget.ImageView;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import androidx.annotation.NonNull;
+          import androidx.appcompat.app.AppCompatActivity;
+          import androidx.appcompat.widget.Toolbar;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.content.ContextCompat;
+          import com.google.android.material.card.MaterialCardView;
+          import com.google.android.material.chip.Chip;
+          import com.google.android.material.floatingactionbutton.FloatingActionButton;
+          import com.google.android.material.snackbar.Snackbar;
+          import com.google.android.material.switchmaterial.SwitchMaterial;
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Date;
+          import java.util.List;
+          import java.util.Locale;
+          public class MainActivity extends AppCompatActivity implements RecognitionListener {
+              private static final String TAG = "VoiceControl";
+              private static final int REQUEST_PERMISSIONS = 1001;
+              private static final int RESTART_DELAY = 600;
+              private SpeechRecognizer speechRecognizer;
+              private SystemController systemController;
+              private CommandProcessor commandProcessor;
+              private TtsManager ttsManager;
+              private HistoryManager historyManager;
+              private FloatingActionButton fabMic;
+              private ImageView ivWaveform;
+              private TextView tvStatus, tvOutput, tvLastCmd, tvDeviceInfo;
+              private MaterialCardView cardStatus;
+              private SwitchMaterial switchContinuous;
+              private ScrollView scrollOutput;
+              private Chip chipBt, chipWifi, chipFlash, chipMute;
+              private boolean isListening = false;
+              private boolean isContinuous = false;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private SharedPreferences prefs;
+              private Animation pulseAnim;
+              private static final String[] PERMISSIONS = {
+                  Manifest.permission.RECORD_AUDIO,
+                  Manifest.permission.MODIFY_AUDIO_SETTINGS,
+                  Manifest.permission.CALL_PHONE,
+                  Manifest.permission.READ_CONTACTS,
+                  Manifest.permission.CAMERA,
+              };
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  setContentView(R.layout.activity_main);
+                  prefs = getSharedPreferences("vcprefs", MODE_PRIVATE);
+                  systemController = new SystemController(this);
+                  commandProcessor = new CommandProcessor(this, systemController);
+                  ttsManager = new TtsManager(this);
+                  historyManager = new HistoryManager(this);
+                  Toolbar tb = findViewById(R.id.toolbar);
+                  setSupportActionBar(tb);
+                  if (getSupportActionBar() != null) {
+                      getSupportActionBar().setTitle("Voice Control");
+                      getSupportActionBar().setSubtitle("Android " + Build.VERSION.RELEASE);
+                  }
+                  bindViews();
+                  pulseAnim = AnimationUtils.loadAnimation(this, R.anim.pulse);
+                  checkPermissions();
+                  refreshChips();
+                  showDeviceInfo();
+              }
+              private void bindViews() {
+                  fabMic = findViewById(R.id.fab_mic);
+                  ivWaveform = findViewById(R.id.iv_waveform);
+                  tvStatus = findViewById(R.id.tv_status);
+                  tvOutput = findViewById(R.id.tv_output);
+                  tvLastCmd = findViewById(R.id.tv_last_cmd);
+                  tvDeviceInfo = findViewById(R.id.tv_device_info);
+                  cardStatus = findViewById(R.id.card_status);
+                  switchContinuous = findViewById(R.id.switch_continuous);
+                  scrollOutput = findViewById(R.id.scroll_output);
+                  chipBt = findViewById(R.id.chip_bt);
+                  chipWifi = findViewById(R.id.chip_wifi);
+                  chipFlash = findViewById(R.id.chip_flash);
+                  chipMute = findViewById(R.id.chip_mute);
+                  fabMic.setOnClickListener(v -> { if (isListening) stopVoice(); else startVoice(); });
+                  boolean savedCont = prefs.getBoolean("continuous", false);
+                  switchContinuous.setChecked(savedCont);
+                  isContinuous = savedCont;
+                  switchContinuous.setOnCheckedChangeListener((b, on) -> {
+                      isContinuous = on;
+                      prefs.edit().putBoolean("continuous", on).apply();
+                      if (on) { startService(new Intent(this, VoiceListenerService.class).setAction(VoiceListenerService.ACTION_START)); log("Always-on listening ENABLED"); }
+                      else { startService(new Intent(this, VoiceListenerService.class).setAction(VoiceListenerService.ACTION_STOP)); log("Always-on listening DISABLED"); }
+                  });
+                  chipBt.setOnClickListener(v -> runCmd("toggle bluetooth"));
+                  chipWifi.setOnClickListener(v -> runCmd("toggle wifi"));
+                  chipFlash.setOnClickListener(v -> runCmd("toggle flashlight"));
+                  chipMute.setOnClickListener(v -> runCmd("toggle mute"));
+                  setStatus("Tap mic to start", false);
+              }
+              private void startVoice() {
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      Snackbar.make(fabMic, "Microphone permission needed", Snackbar.LENGTH_LONG).setAction("Grant", v -> checkPermissions()).show();
+                      return;
+                  }
+                  if (speechRecognizer != null) speechRecognizer.destroy();
+                  speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+                  speechRecognizer.setRecognitionListener(this);
+                  Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                  i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+                  i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault());
+                  i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
+                  i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+                  if (Build.VERSION.SDK_INT >= 33) i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
+                  i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L);
+                  try {
+                      speechRecognizer.startListening(i);
+                      isListening = true;
+                      fabMic.setImageResource(R.drawable.ic_mic_active);
+                      ivWaveform.startAnimation(pulseAnim);
+                      setStatus("Listening...", true);
+                  } catch (Exception e) { setStatus("Error: " + e.getMessage(), false); }
+              }
+              private void stopVoice() {
+                  if (speechRecognizer != null) speechRecognizer.stopListening();
+                  isListening = false;
+                  fabMic.setImageResource(R.drawable.ic_mic);
+                  ivWaveform.clearAnimation();
+                  setStatus("Processing...", false);
+              }
+              private void runCmd(String cmd) {
+                  tvLastCmd.setText("\"" + cmd + "\"");
+                  CommandResult r = commandProcessor.process(cmd);
+                  if (r != null) { log(r.getOutput()); ttsManager.speak(r.getTts()); historyManager.add(cmd, r.getMessage(), r.ok()); handler.postDelayed(this::refreshChips, 400); }
+              }
+              @Override public void onReadyForSpeech(Bundle p) { setStatus("Ready...", true); }
+              @Override public void onBeginningOfSpeech() { setStatus("Hearing you...", true); }
+              @Override public void onBufferReceived(byte[] b) {}
+              @Override public void onEvent(int t, Bundle p) {}
+              @Override public void onRmsChanged(float rms) { float s = 1f + Math.max(0, rms) / 25f; ivWaveform.setScaleX(s); ivWaveform.setScaleY(s); }
+              @Override public void onEndOfSpeech() { isListening = false; ivWaveform.setScaleX(1f); ivWaveform.setScaleY(1f); setStatus("Processing...", false); }
+              @Override public void onError(int err) {
+                  isListening = false; fabMic.setImageResource(R.drawable.ic_mic); ivWaveform.clearAnimation(); ivWaveform.setScaleX(1f); ivWaveform.setScaleY(1f);
+                  setStatus("Try again", false);
+                  if (isContinuous) handler.postDelayed(this::startVoice, RESTART_DELAY * 3L);
+              }
+              @Override public void onPartialResults(Bundle b) {
+                  ArrayList<String> p = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                  if (p != null && !p.isEmpty()) tvLastCmd.setText("Hearing: \"" + p.get(0) + "\"");
+              }
+              @Override public void onResults(Bundle results) {
+                  isListening = false; fabMic.setImageResource(R.drawable.ic_mic); ivWaveform.clearAnimation(); ivWaveform.setScaleX(1f); ivWaveform.setScaleY(1f);
+                  ArrayList<String> m = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                  if (m != null && !m.isEmpty()) { String cmd = m.get(0); setStatus("Got it!", false); log("You said: \"" + cmd + "\""); runCmd(cmd); }
+                  else setStatus("No speech detected", false);
+                  if (isContinuous) handler.postDelayed(this::startVoice, RESTART_DELAY);
+              }
+              private void setStatus(String msg, boolean active) {
+                  runOnUiThread(() -> { tvStatus.setText(msg); cardStatus.setCardBackgroundColor(getColor(active ? R.color.colorListening : R.color.colorIdle)); });
+              }
+              private void log(String text) {
+                  runOnUiThread(() -> {
+                      String ts = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
+                      String cur = tvOutput.getText().toString();
+                      String line = "[" + ts + "] " + text;
+                      tvOutput.setText(cur.isEmpty() ? line : cur + "\n\n" + line);
+                      handler.postDelayed(() -> scrollOutput.fullScroll(View.FOCUS_DOWN), 80);
+                  });
+              }
+              private void refreshChips() {
+                  runOnUiThread(() -> {
+                      try {
+                          boolean bt = systemController.isBluetoothOn(); boolean wf = systemController.isWifiOn(); boolean fl = systemController.isFlashOn(); boolean mu = systemController.isMuted();
+                          chipBt.setText(bt ? "BT: ON" : "BT: OFF"); chipBt.setChipBackgroundColorResource(bt ? R.color.colorActive : R.color.colorInactive);
+                          chipWifi.setText(wf ? "WiFi: ON" : "WiFi: OFF"); chipWifi.setChipBackgroundColorResource(wf ? R.color.colorActive : R.color.colorInactive);
+                          chipFlash.setText(fl ? "Flash: ON" : "Flash: OFF"); chipFlash.setChipBackgroundColorResource(fl ? R.color.colorActive : R.color.colorInactive);
+                          chipMute.setText(mu ? "Muted" : "Sound: ON"); chipMute.setChipBackgroundColorResource(mu ? R.color.colorWarning : R.color.colorActive);
+                      } catch (Exception ignored) {}
+                  });
+              }
+              private void showDeviceInfo() { tvDeviceInfo.setText(Build.MANUFACTURER + " " + Build.MODEL + " | Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"); }
+              private void checkPermissions() {
+                  List<String> need = new ArrayList<>();
+                  for (String p : PERMISSIONS) if (ContextCompat.checkSelfPermission(this, p) != PackageManager.PERMISSION_GRANTED) need.add(p);
+                  if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) need.add(Manifest.permission.POST_NOTIFICATIONS);
+                  if (!need.isEmpty()) ActivityCompat.requestPermissions(this, need.toArray(new String[0]), REQUEST_PERMISSIONS);
+                  else onReady();
+              }
+              @Override public void onRequestPermissionsResult(int req, @NonNull String[] perms, @NonNull int[] res) { super.onRequestPermissionsResult(req, perms, res); onReady(); }
+              private void onReady() {
+                  log("Voice Control ready!\n\nSay commands like:\n- Turn on WiFi\n- Turn on flashlight\n- Set volume to 50 percent\n- Increase brightness\n- Mute / Unmute\n- Open YouTube\n- What time is it?\n- What is my battery level?\n- Take screenshot\n- Dark mode on\n- Call Mom");
+              }
+              @Override public boolean onCreateOptionsMenu(Menu m) { getMenuInflater().inflate(R.menu.main_menu, m); return true; }
+              @Override public boolean onOptionsItemSelected(@NonNull MenuItem item) {
+                  int id = item.getItemId();
+                  if (id == R.id.menu_history) { startActivity(new Intent(this, CommandHistoryActivity.class)); return true; }
+                  else if (id == R.id.menu_settings) { startActivity(new Intent(this, SettingsActivity.class)); return true; }
+                  else if (id == R.id.menu_clear) { tvOutput.setText(""); return t
